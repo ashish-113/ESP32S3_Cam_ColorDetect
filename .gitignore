@@ -1,0 +1,23 @@
+# Arduino build artifacts
+build/
+*.hex
+*.bin
+*.elf
+*.map
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.bak
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Secrets / local config
+*.secrets
+secrets.h
+wifi_credentials.h
