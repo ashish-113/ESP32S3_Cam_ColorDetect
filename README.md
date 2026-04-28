@@ -1,17 +1,41 @@
 # ESP32 / ESP32-S3 Robotics Sketches
 
-Two self-contained Arduino sketches for two different boards:
+Two self-contained Arduino sketches for two different boards that
+communicate with each other over I2C:
 
 - [`ESP32-S3-CAM/`](ESP32-S3-CAM/) - **ESP32-S3-CAM AI Vision Module**
-  (Hiwonder / ThinkRobotics). Wi-Fi hotspot, live MJPEG stream, and
-  red / green / black color detection in the browser.
+  (Hiwonder / ThinkRobotics). Wi-Fi hotspot, live MJPEG stream,
+  red / green / black color detection in the browser, and an **I2C slave**
+  endpoint at address `0x52` that publishes the latest detection.
 - [`ESP32_mcu/`](ESP32_mcu/) - **ESP32 Dev Module** driving a small
-  differential-drive robot: two hobby DC motors via an L298N driver and
-  a BFD1000 5-channel line / obstacle sensor array.
+  differential-drive robot: two hobby DC motors via an L298N driver,
+  a BFD1000 5-channel line / obstacle sensor array, and an **I2C master**
+  that polls the camera every 200 ms and can react to the detected color.
 
 Each sketch lives in its own folder so Arduino IDE can open and compile it
-without complaints. They are unrelated firmwares - flash one to its
-respective board.
+without complaints.
+
+## I2C wiring between the two boards
+
+| Camera (ESP32-S3-CAM, slave) | Robot (ESP32 Dev Module, master) |
+|---|---|
+| `IIC.SDA` | `GPIO 21` (default `SDA`) |
+| `IIC.SCL` | `GPIO 22` (default `SCL`) |
+| `GND`     | `GND` (must be tied together)    |
+
+Camera publishes 5 bytes from register `0x00`:
+
+| Byte | Meaning |
+|---|---|
+| 0 | dominant: `0=none, 1=red, 2=green, 3=black` |
+| 1 | red percentage (0..100) |
+| 2 | green percentage (0..100) |
+| 3 | black percentage (0..100) |
+| 4 | confidence percentage (0..100) |
+
+If your Hiwonder expansion board routes the IIC header to GPIOs other
+than 1 / 2, change `I2C_SDA_PIN` / `I2C_SCL_PIN` near the top of
+[`ESP32-S3-CAM/ESP32-S3-CAM.ino`](ESP32-S3-CAM/ESP32-S3-CAM.ino).
 
 ---
 
@@ -64,6 +88,9 @@ Folder: [`ESP32-S3-CAM/ESP32-S3-CAM.ino`](ESP32-S3-CAM/ESP32-S3-CAM.ino)
 - Each pixel is converted RGB565 -> RGB888 -> HSV and classified as
   `red`, `green`, `black`, or `other`. "Confidence" is the percentage of
   sampled pixels in the dominant class.
+- After every analyzed frame the camera also publishes the result on its
+  IIC header as I2C **slave** at address `0x52` (5-byte response from
+  register `0x00`, see top of this README).
 
 ## Hardware
 
@@ -175,6 +202,11 @@ wiring can be verified independently:
 3. **Optional line follower**: simple bang-bang controller using all five
    sensors plus the NEAR pin for obstacle stop. Disabled by default; flip
    `ENABLE_LINE_FOLLOW = true` once steps 1 and 2 look right.
+4. **Camera link over I2C**: every 200 ms the bot polls the ESP32-S3-CAM
+   at address `0x52` and prints the detected color on Serial. Flip
+   `ENABLE_COLOR_REACTION = true` to make it act on the color (default
+   mapping: red = stop, green = drive forward, anything else = defer to
+   the line follower).
 
 ## Hardware
 

@@ -8,12 +8,24 @@
 #include "esp_log.h"
 #include <WiFi.h>
 #include <WebServer.h>
+#include <Wire.h>
+#include <math.h>
 
 // ---------- Hotspot ----------
 const char* AP_SSID = "ESP32S3-CAM";   // open network, no password
 const IPAddress AP_IP (192,168,4,1);
 const IPAddress AP_GW (192,168,4,1);
 const IPAddress AP_SN (255,255,255,0);
+
+// ---------- I2C: this board acts as I2C SLAVE for the bot MCU ----------
+// Wire camera IIC.SDA -> ESP32 GPIO21, camera IIC.SCL -> ESP32 GPIO22.
+// Common GND is required between the two boards.
+// If your Hiwonder expansion board routes the IIC header to different
+// GPIOs, only change these two pin defines.
+#define I2C_SLAVE_ADDR  0x52
+#define I2C_SDA_PIN     1
+#define I2C_SCL_PIN     2
+#define I2C_FREQ_HZ     100000
 
 // ---------- Pin map: Hiwonder / NullLab ESP32-S3-CAM ----------
 #define PWDN_GPIO_NUM   -1
@@ -40,6 +52,54 @@ struct Detection {
   const char* dominant = "none";
   float confidence = 0;
 } det;
+
+// ---------- I2C publish buffer ----------
+// Five bytes that an external I2C master can read from register 0x00:
+//   [0] dominant code (0=none, 1=red, 2=green, 3=black)
+//   [1] red %      (0..100)
+//   [2] green %    (0..100)
+//   [3] black %    (0..100)
+//   [4] confidence (0..100)
+volatile uint8_t pubBuf[5] = {0, 0, 0, 0, 0};
+volatile uint8_t i2cReg    = 0;
+
+static inline uint8_t clamp100(float v) {
+  int x = (int)roundf(v);
+  if (x < 0)   x = 0;
+  if (x > 100) x = 100;
+  return (uint8_t)x;
+}
+
+static uint8_t dominantCode() {
+  if (det.confidence < 1.0f)               return 0;
+  if (strcmp(det.dominant, "red")   == 0)  return 1;
+  if (strcmp(det.dominant, "green") == 0)  return 2;
+  if (strcmp(det.dominant, "black") == 0)  return 3;
+  return 0;
+}
+
+static void publishDetection() {
+  pubBuf[0] = dominantCode();
+  pubBuf[1] = clamp100(det.red);
+  pubBuf[2] = clamp100(det.green);
+  pubBuf[3] = clamp100(det.black);
+  pubBuf[4] = clamp100(det.confidence);
+}
+
+// I2C slave callbacks. Keep these tiny - they run in interrupt context.
+void onI2CReceive(int n) {
+  if (n >= 1) i2cReg = Wire.read();
+  while (Wire.available()) Wire.read();
+}
+
+void onI2CRequest() {
+  if (i2cReg == 0x00) {
+    Wire.write((const uint8_t*)pubBuf, 5);
+  } else {
+    uint8_t z = 0xFF;
+    Wire.write(&z, 1);
+  }
+}
 
 // ---------- Color classification ----------
 static inline uint8_t classify(uint8_t r, uint8_t g, uint8_t b) {
@@ -156,6 +216,7 @@ void handleJpg() {
 
   if (fb->format == PIXFORMAT_RGB565) {
     analyzeRGB565(fb->buf, fb->width, fb->height);
+    publishDetection();
   }
 
   uint8_t* jpg_buf = nullptr;
@@ -246,6 +307,13 @@ void setup() {
   WiFi.softAPConfig(AP_IP, AP_GW, AP_SN);
   WiFi.softAP(AP_SSID);
   Serial.printf("AP: %s  IP: %s\n", AP_SSID, WiFi.softAPIP().toString().c_str());
+
+  // Start as I2C slave on the IIC header (custom pins on ESP32-S3).
+  Wire.begin((uint8_t)I2C_SLAVE_ADDR, I2C_SDA_PIN, I2C_SCL_PIN, I2C_FREQ_HZ);
+  Wire.onReceive(onI2CReceive);
+  Wire.onRequest(onI2CRequest);
+  Serial.printf("I2C slave at 0x%02X on SDA=%d SCL=%d\n",
+                I2C_SLAVE_ADDR, I2C_SDA_PIN, I2C_SCL_PIN);
 
   server.on("/",       handleRoot);
   server.on("/jpg",    handleJpg);

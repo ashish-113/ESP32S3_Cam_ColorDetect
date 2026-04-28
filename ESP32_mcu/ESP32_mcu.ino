@@ -34,7 +34,17 @@
 //   CLIP -> not connected
 //   Vcc  -> Battery + (typically 3.3 V or 5 V; check board)
 //   GND  -> Battery -
+//
+// I2C link to ESP32-S3-CAM (camera is the I2C SLAVE at 0x52)
+//   ESP32 SDA (GPIO21) -> camera IIC SDA
+//   ESP32 SCL (GPIO22) -> camera IIC SCL
+//   GND               <-> camera GND   (common ground required!)
+// Camera publishes 5 bytes from register 0x00:
+//   [0] dominant code: 0=none, 1=red, 2=green, 3=black
+//   [1] red %      [2] green %    [3] black %    [4] confidence %
 // =====================================================================
+
+#include <Wire.h>
 
 #define IN1 13
 #define IN2 19
@@ -55,9 +65,17 @@
 // NEAR pin polarity (most modules: LOW when an obstacle is close).
 #define OBSTACLE_ACTIVE_LEVEL  LOW
 
+// ---------- I2C link to camera ----------
+#define CAM_I2C_ADDR    0x52
+#define I2C_SDA_PIN     21
+#define I2C_SCL_PIN     22
+#define I2C_FREQ_HZ     100000
+#define CAM_POLL_MS     200
+
 // ---------- behaviour switches ----------
 const bool ENABLE_BOOT_MOTOR_TEST = true;   // drive a short sequence on power-up
 const bool ENABLE_LINE_FOLLOW     = false;  // flip to true after the wiring is verified
+const bool ENABLE_COLOR_REACTION  = false;  // act on color from the camera (red=stop, green=go)
 const uint32_t SERIAL_PRINT_MS    = 200;
 
 // =====================================================================
@@ -105,6 +123,47 @@ inline bool onLine(int v)        { return v == LINE_ACTIVE_LEVEL; }
 inline bool obstacleClose(int v) { return v == OBSTACLE_ACTIVE_LEVEL; }
 
 // =====================================================================
+//                    CAMERA I2C CLIENT (read color)
+// =====================================================================
+struct CamColor {
+  uint8_t dominant;     // 0=none, 1=red, 2=green, 3=black
+  uint8_t red;          // %
+  uint8_t green;        // %
+  uint8_t black;        // %
+  uint8_t confidence;   // %
+  bool    valid;        // true if last poll succeeded
+};
+
+CamColor lastCam = {0, 0, 0, 0, 0, false};
+
+const char* colorName(uint8_t code) {
+  switch (code) {
+    case 1: return "red";
+    case 2: return "green";
+    case 3: return "black";
+    default: return "none";
+  }
+}
+
+CamColor pollCamera() {
+  CamColor c = {0, 0, 0, 0, 0, false};
+  Wire.beginTransmission(CAM_I2C_ADDR);
+  Wire.write((uint8_t)0x00);                    // request "summary" register
+  if (Wire.endTransmission() != 0) return c;    // camera not responding
+
+  uint8_t got = Wire.requestFrom((uint8_t)CAM_I2C_ADDR, (uint8_t)5);
+  if (got != 5) return c;
+
+  c.dominant   = Wire.read();
+  c.red        = Wire.read();
+  c.green      = Wire.read();
+  c.black      = Wire.read();
+  c.confidence = Wire.read();
+  c.valid      = true;
+  return c;
+}
+
+// =====================================================================
 //                              SETUP
 // =====================================================================
 void setup() {
@@ -121,6 +180,11 @@ void setup() {
   pinMode(S3, INPUT);   pinMode(S4, INPUT);
   pinMode(S5, INPUT);   pinMode(NEAR, INPUT);
 
+  // I2C master on default ESP32 pins (21=SDA, 22=SCL).
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN, (uint32_t)I2C_FREQ_HZ);
+  Serial.printf("I2C master ready, polling camera @0x%02X on SDA=%d SCL=%d\n",
+                CAM_I2C_ADDR, I2C_SDA_PIN, I2C_SCL_PIN);
+
   if (ENABLE_BOOT_MOTOR_TEST) {
     Serial.println("Motor self-test starting...");
     Serial.println(" -> forward 600 ms");
@@ -136,6 +200,8 @@ void setup() {
 
   Serial.print("Line follow mode: ");
   Serial.println(ENABLE_LINE_FOLLOW ? "ENABLED" : "disabled (sensor-monitor only)");
+  Serial.print("Color reaction:   ");
+  Serial.println(ENABLE_COLOR_REACTION ? "ENABLED" : "disabled");
 }
 
 // =====================================================================
@@ -144,18 +210,47 @@ void setup() {
 void loop() {
   SensorReadings s = readSensors();
 
-  // Periodic serial dump so you can verify wiring / orientation.
+  // ---- poll camera over I2C every CAM_POLL_MS ----
+  static uint32_t lastPoll = 0;
+  if (millis() - lastPoll > CAM_POLL_MS) {
+    lastPoll = millis();
+    lastCam = pollCamera();
+  }
+
+  // ---- periodic serial dump (sensors + camera color) ----
   static uint32_t lastPrint = 0;
   if (millis() - lastPrint > SERIAL_PRINT_MS) {
     lastPrint = millis();
-    Serial.printf("S1=%d S2=%d S3=%d S4=%d S5=%d  NEAR=%d  line=[%c%c%c%c%c] obst=%c\n",
+    Serial.printf("S1=%d S2=%d S3=%d S4=%d S5=%d  NEAR=%d  line=[%c%c%c%c%c] obst=%c | cam=%s",
                   s.s1, s.s2, s.s3, s.s4, s.s5, s.near_,
                   onLine(s.s1) ? '#' : '.',
                   onLine(s.s2) ? '#' : '.',
                   onLine(s.s3) ? '#' : '.',
                   onLine(s.s4) ? '#' : '.',
                   onLine(s.s5) ? '#' : '.',
-                  obstacleClose(s.near_) ? 'X' : '.');
+                  obstacleClose(s.near_) ? 'X' : '.',
+                  lastCam.valid ? colorName(lastCam.dominant) : "??");
+    if (lastCam.valid) {
+      Serial.printf(" R=%u G=%u K=%u conf=%u\n",
+                    lastCam.red, lastCam.green, lastCam.black, lastCam.confidence);
+    } else {
+      Serial.println();
+    }
+  }
+
+  // ---- optional: react to color seen by the camera ----
+  // Example mapping: red -> stop, green -> drive forward, anything else -> defer
+  // to the line follower or stop. Tweak this block to taste.
+  if (ENABLE_COLOR_REACTION && lastCam.valid && lastCam.confidence >= 5) {
+    if (lastCam.dominant == 1) {        // red
+      stopMotors();
+      return;
+    }
+    if (lastCam.dominant == 2) {        // green
+      driveForward();
+      return;
+    }
+    // dominant == 3 (black) or 0 (none): fall through to line follower / stop.
   }
 
   if (!ENABLE_LINE_FOLLOW) {
