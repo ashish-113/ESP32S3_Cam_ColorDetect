@@ -260,20 +260,6 @@ If the boot self-test shows something off, fix it once and forget it:
 
 ---
 
-## Day-to-day git workflow
-
-From the repo root (`C:\Users\ashis\Documents\GitHub\ESP32-S3-CAM\`):
-
-```powershell
-git status                       # see what changed
-git add .                        # stage all changes
-git commit -m "describe change"  # commit locally
-git push                         # send to GitHub (origin/main)
-```
-
-`gh auth setup-git` is already configured, so `git push` does not prompt
-for credentials.
-
 ## Credits / references
 
 - Hiwonder ESP32-S3-CAM product page (ThinkRobotics):
