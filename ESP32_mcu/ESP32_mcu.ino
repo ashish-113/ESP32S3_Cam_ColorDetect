@@ -145,12 +145,19 @@ const char* colorName(uint8_t code) {
   }
 }
 
+// Read the camera's "summary" register (0x00).
+// Returns CamColor{ valid=false } when the camera is not responding (wrong
+// address, broken wire, missing common ground, etc.) - keep an eye on the
+// serial log: `cam=??` means the master got nothing back.
 CamColor pollCamera() {
   CamColor c = {0, 0, 0, 0, 0, false};
-  Wire.beginTransmission(CAM_I2C_ADDR);
-  Wire.write((uint8_t)0x00);                    // request "summary" register
-  if (Wire.endTransmission() != 0) return c;    // camera not responding
 
+  // Step 1: tell the slave which register we want.
+  Wire.beginTransmission(CAM_I2C_ADDR);
+  Wire.write((uint8_t)0x00);
+  if (Wire.endTransmission() != 0) return c;    // ack failed
+
+  // Step 2: read 5 bytes of detection back.
   uint8_t got = Wire.requestFrom((uint8_t)CAM_I2C_ADDR, (uint8_t)5);
   if (got != 5) return c;
 

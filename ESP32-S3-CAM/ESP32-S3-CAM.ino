@@ -54,12 +54,22 @@ struct Detection {
 } det;
 
 // ---------- I2C publish buffer ----------
-// Five bytes that an external I2C master can read from register 0x00:
-//   [0] dominant code (0=none, 1=red, 2=green, 3=black)
-//   [1] red %      (0..100)
-//   [2] green %    (0..100)
-//   [3] black %    (0..100)
-//   [4] confidence (0..100)
+//
+// Wire protocol (this board is the slave, address I2C_SLAVE_ADDR = 0x52):
+//   master -> slave : 1-byte register address (only 0x00 supported)
+//   master <- slave : 5 bytes when register == 0x00:
+//     [0] dominant code (0=none, 1=red, 2=green, 3=black)
+//     [1] red %      (0..100)
+//     [2] green %    (0..100)
+//     [3] black %    (0..100)
+//     [4] confidence (0..100)   = the dominant class' percentage
+//
+// Wire example on the master side (Arduino-style):
+//   Wire.beginTransmission(0x52); Wire.write(0x00); Wire.endTransmission();
+//   Wire.requestFrom(0x52, 5);
+//   uint8_t dom = Wire.read(); uint8_t r = Wire.read(); ...
+//
+// The five bytes are refreshed once per analyzed frame inside handleJpg().
 volatile uint8_t pubBuf[5] = {0, 0, 0, 0, 0};
 volatile uint8_t i2cReg    = 0;
 
@@ -326,10 +336,19 @@ void setup() {
 void loop() {
   server.handleClient();
 
+  // Once per second, print the detection plus the bytes a master would read
+  // over I2C from register 0x00. Useful for verifying the link without
+  // actually hooking up a master.
   static uint32_t lastLog = 0;
   if (millis() - lastLog > 1000) {
     lastLog = millis();
-    Serial.printf("R=%.1f%% G=%.1f%% K=%.1f%% dom=%s (%.1f%%)\n",
-                  det.red, det.green, det.black, det.dominant, det.confidence);
+    const char* domNames[4] = {"none", "red", "green", "black"};
+    uint8_t dc = pubBuf[0] < 4 ? pubBuf[0] : 0;
+    Serial.printf("R=%.1f%% G=%.1f%% K=%.1f%% dom=%s (%.1f%%) | "
+                  "i2c@0x%02X reg0x00 -> [%u,%u,%u,%u,%u] (%s)\n",
+                  det.red, det.green, det.black, det.dominant, det.confidence,
+                  I2C_SLAVE_ADDR,
+                  pubBuf[0], pubBuf[1], pubBuf[2], pubBuf[3], pubBuf[4],
+                  domNames[dc]);
   }
 }
