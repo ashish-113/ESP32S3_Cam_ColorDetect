@@ -53,7 +53,6 @@
 // =====================================================================
 
 #include <Wire.h>
-#include <ESP32Servo.h>
 
 #define IN1 13
 #define IN2 19
@@ -81,7 +80,7 @@
 #define I2C_FREQ_HZ     100000
 #define CAM_POLL_MS     200
 
-// ---------- Servo (ESP32Servo library) ----------
+// ---------- Servo (native ESP32 LEDC PWM, no extra library) ----------
 #define SERVO_PIN              23
 #define SERVO_REST_ANGLE        0    // deg, idle position
 #define SERVO_ACTUATED_ANGLE   90    // deg, "fire" position
@@ -175,23 +174,41 @@ void pollCamera() {
 }
 
 // =====================================================================
-//                        SERVO (ESP32Servo)
+//          SERVO (native ESP32 LEDC PWM, no extra library)
 // =====================================================================
-Servo gServo;
+// Drives a hobby servo with a 50 Hz PWM signal where the duty cycle
+// encodes the pulse width (~500 us -> 0 deg, ~2400 us -> 180 deg).
+// Uses LEDC channel 4 - channels 0..3 are sometimes used by other libs
+// for tone() etc, channel 4 is normally free on a plain ESP32.
+#define SERVO_LEDC_CHANNEL  4
+#define SERVO_LEDC_FREQ_HZ  50
+#define SERVO_LEDC_RES_BITS 16
+#define SERVO_PULSE_MIN_US  500
+#define SERVO_PULSE_MAX_US  2400
+
 uint32_t lastSweepEndMs = 0;   // when the last actuation cycle finished
 
+static void servoWriteAngle(int deg) {
+  if (deg < 0)   deg = 0;
+  if (deg > 180) deg = 180;
+  // Map angle to pulse width in microseconds.
+  uint32_t us = SERVO_PULSE_MIN_US +
+                (uint32_t)deg * (SERVO_PULSE_MAX_US - SERVO_PULSE_MIN_US) / 180;
+  // Convert pulse width -> 16-bit duty for a 50 Hz (20 ms) period.
+  uint32_t duty = (us * ((1UL << SERVO_LEDC_RES_BITS) - 1)) / 20000UL;
+  ledcWrite(SERVO_LEDC_CHANNEL, duty);
+}
+
 void servoInit() {
-  // The ESP32Servo library wants a periodHertz set before attach() so the
-  // PWM timing matches a hobby servo (50 Hz, ~1-2 ms pulse).
-  gServo.setPeriodHertz(50);
-  gServo.attach(SERVO_PIN, 500, 2400);   // microseconds for 0..180 deg
-  gServo.write(SERVO_REST_ANGLE);
+  ledcSetup(SERVO_LEDC_CHANNEL, SERVO_LEDC_FREQ_HZ, SERVO_LEDC_RES_BITS);
+  ledcAttachPin(SERVO_PIN, SERVO_LEDC_CHANNEL);
+  servoWriteAngle(SERVO_REST_ANGLE);
 }
 
 void servoActuate() {
-  gServo.write(SERVO_ACTUATED_ANGLE);
+  servoWriteAngle(SERVO_ACTUATED_ANGLE);
   delay(SERVO_HOLD_MS);
-  gServo.write(SERVO_REST_ANGLE);
+  servoWriteAngle(SERVO_REST_ANGLE);
   delay(SERVO_RETURN_MS);
   lastSweepEndMs = millis();
 }

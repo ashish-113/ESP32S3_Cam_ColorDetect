@@ -60,9 +60,10 @@ than 1 / 2, change `I2C_SDA_PIN` / `I2C_SCL_PIN` near the top of
 - ESP32 board support package by Espressif Systems, v2.0.17 (tested);
   v3.x also works.
 - A USB-C **data** cable (charge-only cables will not enumerate a COM port).
-- For the robot sketch only: the **ESP32Servo** library
-  (Sketch > Include Library > Manage Libraries... > search
-  "ESP32Servo" by Kevin Harrington / John K. Bennett > Install).
+
+No extra Arduino libraries are needed. The robot sketch drives the servo
+through the ESP32 core's built-in LEDC PWM, so there is no `ESP32Servo`
+library to install.
 
 ### One-time IDE setup
 
