@@ -53,6 +53,7 @@
 // =====================================================================
 
 #include <Wire.h>
+#include <ESP32Servo.h>
 
 #define IN1 13
 #define IN2 19
@@ -80,7 +81,7 @@
 #define I2C_FREQ_HZ     100000
 #define CAM_POLL_MS     200
 
-// ---------- Servo (native ESP32 LEDC PWM, no extra library) ----------
+// ---------- Servo (ESP32Servo library) ----------
 #define SERVO_PIN              23
 #define SERVO_REST_ANGLE        0    // deg, idle position
 #define SERVO_ACTUATED_ANGLE   90    // deg, "fire" position
@@ -160,10 +161,37 @@ void pollCamera() {
   camValid = false;
   Wire.beginTransmission(CAM_I2C_ADDR);
   Wire.write((uint8_t)0x00);                    // request "summary" register
-  if (Wire.endTransmission() != 0) return;      // camera not responding
+  uint8_t tx = Wire.endTransmission();
+  if (tx != 0) {
+    // #region agent log
+    // Slave didn't ACK or bus error. tx codes (Arduino ESP32 Wire):
+    //   2 = NACK on address (no slave / wrong addr / wrong pins)
+    //   3 = NACK on data
+    //   4 = other error
+    //   5 = timeout (often: no pull-ups / missing GND)
+    // Hypotheses tested: H1, H2, H3, H4.
+    static uint32_t lastTxErr = 0;
+    if (millis() - lastTxErr > 2000) {
+      lastTxErr = millis();
+      Serial.printf("DBG|poll_tx_err|tx=%u\n", tx);
+    }
+    // #endregion
+    return;
+  }
 
   uint8_t got = Wire.requestFrom((uint8_t)CAM_I2C_ADDR, (uint8_t)5);
-  if (got != 5) return;
+  if (got != 5) {
+    // #region agent log
+    // Address ACKed but slave returned wrong byte count.
+    // Hypothesis tested: H5 (camera onI2CRequest broken / wrong pubBuf size).
+    static uint32_t lastGotErr = 0;
+    if (millis() - lastGotErr > 2000) {
+      lastGotErr = millis();
+      Serial.printf("DBG|poll_got_err|got=%u\n", got);
+    }
+    // #endregion
+    return;
+  }
 
   camDominant   = Wire.read();
   camRed        = Wire.read();
@@ -171,44 +199,37 @@ void pollCamera() {
   camYellow     = Wire.read();
   camConfidence = Wire.read();
   camValid      = true;
+
+  // #region agent log
+  // First successful poll. Print once so we know the exact moment the link
+  // came up and what the camera reported on that frame.
+  static bool announcedOk = false;
+  if (!announcedOk) {
+    announcedOk = true;
+    Serial.printf("DBG|poll_first_ok|dom=%u|R=%u|G=%u|Y=%u|conf=%u\n",
+                  camDominant, camRed, camGreen, camYellow, camConfidence);
+  }
+  // #endregion
 }
 
 // =====================================================================
-//          SERVO (native ESP32 LEDC PWM, no extra library)
+//                        SERVO (ESP32Servo)
 // =====================================================================
-// Drives a hobby servo with a 50 Hz PWM signal where the duty cycle
-// encodes the pulse width (~500 us -> 0 deg, ~2400 us -> 180 deg).
-// Uses LEDC channel 4 - channels 0..3 are sometimes used by other libs
-// for tone() etc, channel 4 is normally free on a plain ESP32.
-#define SERVO_LEDC_CHANNEL  4
-#define SERVO_LEDC_FREQ_HZ  50
-#define SERVO_LEDC_RES_BITS 16
-#define SERVO_PULSE_MIN_US  500
-#define SERVO_PULSE_MAX_US  2400
-
+Servo gServo;
 uint32_t lastSweepEndMs = 0;   // when the last actuation cycle finished
 
-static void servoWriteAngle(int deg) {
-  if (deg < 0)   deg = 0;
-  if (deg > 180) deg = 180;
-  // Map angle to pulse width in microseconds.
-  uint32_t us = SERVO_PULSE_MIN_US +
-                (uint32_t)deg * (SERVO_PULSE_MAX_US - SERVO_PULSE_MIN_US) / 180;
-  // Convert pulse width -> 16-bit duty for a 50 Hz (20 ms) period.
-  uint32_t duty = (us * ((1UL << SERVO_LEDC_RES_BITS) - 1)) / 20000UL;
-  ledcWrite(SERVO_LEDC_CHANNEL, duty);
-}
-
 void servoInit() {
-  ledcSetup(SERVO_LEDC_CHANNEL, SERVO_LEDC_FREQ_HZ, SERVO_LEDC_RES_BITS);
-  ledcAttachPin(SERVO_PIN, SERVO_LEDC_CHANNEL);
-  servoWriteAngle(SERVO_REST_ANGLE);
+  // The ESP32Servo library wants a periodHertz set before attach() so the
+  // PWM timing matches a hobby servo (50 Hz, ~1-2 ms pulse).
+  gServo.setPeriodHertz(50);
+  gServo.attach(SERVO_PIN, 500, 2400);   // microseconds for 0..180 deg
+  gServo.write(SERVO_REST_ANGLE);
 }
 
 void servoActuate() {
-  servoWriteAngle(SERVO_ACTUATED_ANGLE);
+  gServo.write(SERVO_ACTUATED_ANGLE);
   delay(SERVO_HOLD_MS);
-  servoWriteAngle(SERVO_REST_ANGLE);
+  gServo.write(SERVO_REST_ANGLE);
   delay(SERVO_RETURN_MS);
   lastSweepEndMs = millis();
 }
@@ -234,6 +255,28 @@ void setup() {
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN, (uint32_t)I2C_FREQ_HZ);
   Serial.printf("I2C master ready, polling camera @0x%02X on SDA=%d SCL=%d\n",
                 CAM_I2C_ADDR, I2C_SDA_PIN, I2C_SCL_PIN);
+
+  // #region agent log
+  // Probe the I2C bus for any responding slave. Prints a hit per address that
+  // ACKs, plus a summary line so we can tell apart "no bus" / "bus but wrong
+  // address" / "camera at 0x52 OK".
+  // Tests H1 (camera pins wrong), H2 (camera firmware not flashed), H3 (no
+  // common ground), H4 (robot Wire.begin failed/wrong wires).
+  Serial.println("DBG|i2c_scan_start");
+  {
+    uint8_t found = 0;
+    for (uint8_t addr = 1; addr < 127; addr++) {
+      Wire.beginTransmission(addr);
+      uint8_t err = Wire.endTransmission();
+      if (err == 0) {
+        Serial.printf("DBG|i2c_scan_hit|addr=0x%02X\n", addr);
+        found++;
+      }
+    }
+    Serial.printf("DBG|i2c_scan_done|found=%u|expected_cam=0x%02X\n",
+                  found, CAM_I2C_ADDR);
+  }
+  // #endregion
 
   // Servo on GPIO 23, parked at rest.
   servoInit();

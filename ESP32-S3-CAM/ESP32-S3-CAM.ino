@@ -20,8 +20,27 @@ const IPAddress AP_SN (255,255,255,0);
 // ---------- I2C: this board acts as I2C SLAVE for the bot MCU ----------
 // Wire camera IIC.SDA -> ESP32 GPIO21, camera IIC.SCL -> ESP32 GPIO22.
 // Common GND is required between the two boards.
-// If your Hiwonder expansion board routes the IIC header to different
-// GPIOs, only change these two pin defines.
+//
+// PINOUT WARNING: Hiwonder does NOT publish the GPIO mapping of the IIC
+// header on the ESP32-S3-CAM AI Vision Module (DIP-16 carrier). The
+// values below are our best guess. The camera DVP signals already use
+// GPIO 4,5,6,7,8,9,10,11,12,13,15,16,17,18 - so the IIC header MUST
+// route to GPIOs outside that set. The plausible candidates that are
+// commonly broken out on a DIP-16 ESP32-S3 carrier are (in priority
+// order, try one pair at a time and reflash):
+//
+//   PRIMARY  : SDA=1,  SCL=2     <- current setting
+//   ALT 1    : SDA=2,  SCL=1     <- swap (silkscreens are sometimes mirrored)
+//   ALT 2    : SDA=38, SCL=39
+//   ALT 3    : SDA=47, SCL=48
+//   ALT 4    : SDA=21, SCL=14
+//   ALT 5    : SDA=42, SCL=41
+//
+// Avoid GPIO 19/20 (USB D-/D+) and 35/36/37 (PSRAM on octal-PSRAM modules).
+// To verify a pair: flash camera, flash robot, look at robot Serial for
+// `DBG|i2c_scan_hit|addr=0x52`. If you see that, the pair is correct.
+// The camera-side `DBG|cam_i2c_req_count|n=...` line should also start
+// climbing above 0 once the master polls successfully.
 #define I2C_SLAVE_ADDR  0x52
 #define I2C_SDA_PIN     1
 #define I2C_SCL_PIN     2
@@ -63,6 +82,16 @@ struct Detection {
 volatile uint8_t pubBuf[5] = {0, 0, 0, 0, 0};
 volatile uint8_t i2cReg    = 0;
 
+// #region agent log
+// Counter incremented inside onI2CRequest() (interrupt context). The main
+// loop prints this once per second so we can tell whether ANY master
+// transaction is actually reaching this slave. If n stays at 0 while the
+// robot is powered, the bus literally isn't reaching the camera (wrong
+// SDA/SCL pins, no common GND, or wires not seated).
+volatile uint32_t i2cReqCount = 0;
+volatile uint32_t i2cRecvCount = 0;
+// #endregion
+
 static inline uint8_t clamp100(float v) {
   int x = (int)roundf(v);
   if (x < 0)   x = 0;
@@ -88,11 +117,17 @@ static void publishDetection() {
 
 // I2C slave callbacks. Keep these tiny - they run in interrupt context.
 void onI2CReceive(int n) {
+  // #region agent log
+  i2cRecvCount++;
+  // #endregion
   if (n >= 1) i2cReg = Wire.read();
   while (Wire.available()) Wire.read();
 }
 
 void onI2CRequest() {
+  // #region agent log
+  i2cReqCount++;
+  // #endregion
   if (i2cReg == 0x00) {
     Wire.write((const uint8_t*)pubBuf, 5);
   } else {
@@ -317,6 +352,13 @@ void setup() {
   Serial.printf("I2C slave at 0x%02X on SDA=%d SCL=%d\n",
                 I2C_SLAVE_ADDR, I2C_SDA_PIN, I2C_SCL_PIN);
 
+  // #region agent log
+  // Print a structured marker so the bridge log can prove the slave actually
+  // came up with the pins we expected (vs. Wire.begin silently failing).
+  Serial.printf("DBG|cam_i2c_slave_started|sda=%d|scl=%d|addr=0x%02X\n",
+                I2C_SDA_PIN, I2C_SCL_PIN, I2C_SLAVE_ADDR);
+  // #endregion
+
   server.on("/",       handleRoot);
   server.on("/jpg",    handleJpg);
   server.on("/status", handleStatus);
@@ -333,5 +375,18 @@ void loop() {
     lastLog = millis();
     Serial.printf("R=%.1f%% G=%.1f%% Y=%.1f%% dom=%s (%.1f%%)\n",
                   det.red, det.green, det.yellow, det.dominant, det.confidence);
+
+    // #region agent log
+    // Snapshot the volatile ISR counters once per second. If recv stays 0
+    // the robot's address byte never arrives. If recv > 0 but req stays 0
+    // the master is writing but never doing requestFrom() (would imply a
+    // bug on the master side, not a wiring problem).
+    noInterrupts();
+    uint32_t reqs  = i2cReqCount;
+    uint32_t recvs = i2cRecvCount;
+    interrupts();
+    Serial.printf("DBG|cam_i2c_req_count|n=%lu|recv=%lu\n",
+                  (unsigned long)reqs, (unsigned long)recvs);
+    // #endregion
   }
 }
