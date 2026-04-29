@@ -1,16 +1,19 @@
 # ESP32 / ESP32-S3 Robotics Sketches
 
-Two self-contained Arduino sketches for two different boards that
-communicate with each other over I2C:
+Two self-contained Arduino sketches for two different boards that work
+together as a small line-following ball-sorting robot:
 
 - [`ESP32-S3-CAM/`](ESP32-S3-CAM/) - **ESP32-S3-CAM AI Vision Module**
   (Hiwonder / ThinkRobotics). Wi-Fi hotspot, live MJPEG stream,
-  red / green / black color detection in the browser, and an **I2C slave**
+  red / green / yellow color detection in the browser, and an **I2C slave**
   endpoint at address `0x52` that publishes the latest detection.
-- [`ESP32_mcu/`](ESP32_mcu/) - **ESP32 Dev Module** driving a small
-  differential-drive robot: two hobby DC motors via an L298N driver,
-  a BFD1000 5-channel line / obstacle sensor array, and an **I2C master**
-  that polls the camera every 200 ms and can react to the detected color.
+- [`ESP32_mcu/`](ESP32_mcu/) - **ESP32 Dev Module** driving the bot:
+  two hobby DC motors via an L298N driver, a BFD1000 5-channel line +
+  1-channel proximity sensor array, a hobby servo, and an **I2C master**
+  that polls the camera. The bot follows a 3.5 cm black line on white;
+  when the BFD1000 NEAR pin sees a ball it stops, asks the camera what
+  colour it is, and either sweeps the servo (red or yellow) or drives on
+  (green / no colour).
 
 Each sketch lives in its own folder so Arduino IDE can open and compile it
 without complaints.
@@ -27,10 +30,10 @@ Camera publishes 5 bytes from register `0x00`:
 
 | Byte | Meaning |
 |---|---|
-| 0 | dominant: `0=none, 1=red, 2=green, 3=black` |
+| 0 | dominant: `0=none, 1=red, 2=green, 3=yellow` |
 | 1 | red percentage (0..100) |
 | 2 | green percentage (0..100) |
-| 3 | black percentage (0..100) |
+| 3 | yellow percentage (0..100) |
 | 4 | confidence percentage (0..100) |
 
 If your Hiwonder expansion board routes the IIC header to GPIOs other
@@ -57,6 +60,9 @@ than 1 / 2, change `I2C_SDA_PIN` / `I2C_SCL_PIN` near the top of
 - ESP32 board support package by Espressif Systems, v2.0.17 (tested);
   v3.x also works.
 - A USB-C **data** cable (charge-only cables will not enumerate a COM port).
+- For the robot sketch only: the **ESP32Servo** library
+  (Sketch > Include Library > Manage Libraries... > search
+  "ESP32Servo" by Kevin Harrington / John K. Bennett > Install).
 
 ### One-time IDE setup
 
@@ -84,9 +90,9 @@ Folder: [`ESP32-S3-CAM/ESP32-S3-CAM.ino`](ESP32-S3-CAM/ESP32-S3-CAM.ino)
   - `/` - a single page with live video and a live color readout.
   - `/jpg` - captures one frame, runs color detection, returns it as JPEG.
   - `/status` - latest detection as JSON
-    (`red`, `green`, `black`, `dominant`, `confidence`).
+    (`red`, `green`, `yellow`, `dominant`, `confidence`).
 - Each pixel is converted RGB565 -> RGB888 -> HSV and classified as
-  `red`, `green`, `black`, or `other`. "Confidence" is the percentage of
+  `red`, `green`, `yellow`, or `other`. "Confidence" is the percentage of
   sampled pixels in the dominant class.
 - After every analyzed frame the camera also publishes the result on its
   IIC header as I2C **slave** at address `0x52` (5-byte response from
@@ -125,24 +131,31 @@ Folder: [`ESP32-S3-CAM/ESP32-S3-CAM.ino`](ESP32-S3-CAM/ESP32-S3-CAM.ino)
 1. On your phone or laptop, open Wi-Fi settings and join the open network
    **`ESP32S3-CAM`** (ignore the "no internet" warning).
 2. Open **`http://192.168.4.1/`** in any browser.
-3. You should see live video plus live `Red`, `Green`, `Black` percentages
+3. You should see live video plus live `Red`, `Green`, `Yellow` percentages
    and a `Dominant` readout that updates a few times per second.
-4. Quick sanity checks: hold a red object close, then a green one, then
-   cover the lens - each bar should jump in turn.
+4. Quick sanity checks: hold a red ball, then a green ball, then a yellow
+   ball in front of the lens - each bar should jump in turn.
 
 ## Tuning color detection
 
 All thresholds live in `classify()`:
 
 ```cpp
-if (v < 55) return 3;                // black threshold (raise for dim rooms)
-if (s < 85 || v < 60) return 0;      // saturation / brightness floors
-if (h < 20 || h > 340) return 1;     // red hue window
-if (h > 85  && h < 170) return 2;    // green hue window
+if (s < 85 || v < 70) return 0;      // saturation / brightness floors
+if (h < 20 || h > 340) return 1;     // red    hue window  (~0 deg)
+if (h > 40 && h < 70)  return 3;     // yellow hue window  (~60 deg)
+if (h > 85 && h < 170) return 2;     // green  hue window  (~120 deg)
 ```
 
-For warm indoor light, try `s < 60 || v < 45` and widen green to
-`h > 80 && h < 175`.
+Common tweaks:
+
+- Warm / yellowish indoor light: lower the saturation floor to `s < 65`,
+  and tighten yellow to `h > 45 && h < 65` so wood / skin tones don't
+  read as yellow.
+- Bluish daylight: leave yellow as-is; if green looks dull, widen to
+  `h > 80 && h < 175`.
+- The detector deliberately has no "black" bucket. Dark / unlit pixels
+  fall into the `other` class via the `s` and `v` floors.
 
 ## Pin map (camera module)
 
@@ -176,7 +189,7 @@ For warm indoor light, try `s < 60 || v < 45` and widen green to
 - Nothing on Serial Monitor even though it runs - need
   `USB CDC On Boot: Enabled` and `USB Mode: Hardware CDC and JTAG`,
   then re-upload.
-- Stream works but Red / Green / Black stay at 0 - older sketch with an
+- Stream works but Red / Green / Yellow stay at 0 - older sketch with an
   endless MJPEG loop blocking `/status`. The current sketch avoids this.
 - Module not enumerating - hold `BOOT`, tap `RESET`, release `BOOT`, refresh
   `Tools > Port`.
@@ -189,24 +202,24 @@ Folder: [`ESP32_mcu/ESP32_mcu.ino`](ESP32_mcu/ESP32_mcu.ino)
 
 ## What it does
 
-A test/diagnostic firmware split into three behaviours so each part of the
-wiring can be verified independently:
+The robot is a small line-following ball-sorter:
 
-1. **Boot motor self-test** (always on by default): forward 600 ms,
-   backward 600 ms, left 600 ms, right 600 ms, then stop. Confirms each
-   motor's direction and which side is left vs right.
-2. **Continuous sensor monitor**: every 200 ms it prints a line like
-   `S1=1 S2=1 S3=0 S4=1 S5=1 NEAR=1 line=[..#..] obst=.` so you can verify
-   the BFD1000 sees the line and the obstacle output flips when something
-   gets close.
-3. **Optional line follower**: simple bang-bang controller using all five
-   sensors plus the NEAR pin for obstacle stop. Disabled by default; flip
-   `ENABLE_LINE_FOLLOW = true` once steps 1 and 2 look right.
-4. **Camera link over I2C**: every 200 ms the bot polls the ESP32-S3-CAM
-   at address `0x52` and prints the detected color on Serial. Flip
-   `ENABLE_COLOR_REACTION = true` to make it act on the color (default
-   mapping: red = stop, green = drive forward, anything else = defer to
-   the line follower).
+1. **Boot motor self-test** (on by default): forward 600 ms, backward
+   600 ms, left 600 ms, right 600 ms, then stop. Confirms each motor's
+   direction and which side is left vs right.
+2. **Line following on a 3.5 cm black line on white surface** (default
+   `ENABLE_LINE_FOLLOW = true`): simple 5-channel bang-bang controller
+   over the BFD1000.
+3. **Ball detection via BFD1000 NEAR**: when NEAR fires the bot stops,
+   force-polls the camera over I2C, and:
+   - **red** or **yellow** ball -> sweep the servo
+     (`SERVO_REST_ANGLE` -> `SERVO_ACTUATED_ANGLE`, hold, return).
+   - **green** ball or no clear colour -> skip actuation, carry on.
+   A `NEAR_COOLDOWN_MS` window (default 1.5 s) prevents the bot from
+   re-triggering on the same ball while it drives past.
+4. **Continuous sensor / camera monitor on Serial** (115200) every
+   200 ms, e.g.
+   `S1=1 S2=1 S3=0 S4=1 S5=1 NEAR=1 line=[..#..] obst=. | cam=red R=42 G=2 Y=3 conf=42`.
 
 ## Hardware
 
@@ -215,11 +228,15 @@ wiring can be verified independently:
   H-bridges, so a single module is enough for two motors).
 - Chassis: differential drive with a passive caster up front.
 - Sensors: BFD1000 5-channel line sensor + 1-channel proximity (NEAR) pin.
+- Actuator: hobby servo (SG90 / MG90S size) on `GPIO 23`.
 
-Power: motors and sensors from the battery; ESP32 from USB during testing
-or from the L298N's onboard 5 V regulator output. **Tie all grounds
-(ESP32 GND, L298N GND, BFD1000 GND, battery negative) together** - missing
-this is the most common reason "nothing reads" or "motors do nothing".
+Power: motors, sensors and servo from the battery; ESP32 from USB during
+testing or from the L298N's onboard 5 V regulator output. **Tie all grounds
+(ESP32 GND, L298N GND, BFD1000 GND, servo GND, battery negative) together** -
+missing this is the most common reason "nothing reads" or "motors do nothing".
+The servo's V+ should come from battery 5 V, **not** from the ESP32's 3V3
+pin (a hobby servo can momentarily draw 500 mA which will brown the ESP32
+out).
 
 ## Tools menu (robot sketch)
 
@@ -255,6 +272,18 @@ BFD1000 sensor array (digital outputs, active level configurable in source):
 - `Vcc`  -> battery positive (3.3 V or 5 V depending on board variant)
 - `GND`  -> battery negative
 
+Servo (hobby SG90 / MG90S):
+
+- Signal (orange / yellow) -> `GPIO 23`
+- V+      (red)            -> battery 5 V (NOT the ESP32 3V3 pin)
+- GND     (brown / black)  -> common ground with ESP32 / L298N / battery
+
+I2C link to the camera:
+
+- `SDA` -> `GPIO 21` -> camera IIC SDA
+- `SCL` -> `GPIO 22` -> camera IIC SCL
+- shared `GND` (mandatory)
+
 In the sketch, `IN1`/`IN2` drive the left motor and `IN3`/`IN4` drive the
 right motor with the convention `dir = +1` forward, `-1` backward,
 `0` brake.
@@ -278,17 +307,34 @@ If the boot self-test shows something off, fix it once and forget it:
   `S2`<->`S4` in the pin defines (your sensor strip is mounted reversed
   relative to the chassis).
 
+## Tunable behaviour constants
+
+Near the top of [`ESP32_mcu/ESP32_mcu.ino`](ESP32_mcu/ESP32_mcu.ino):
+
+```cpp
+#define SERVO_PIN              23
+#define SERVO_REST_ANGLE        0    // deg, idle position
+#define SERVO_ACTUATED_ANGLE   90    // deg, "fire" position
+#define SERVO_HOLD_MS         500    // hold at actuated angle
+#define SERVO_RETURN_MS       250    // settle back at rest
+#define NEAR_COOLDOWN_MS     1500    // ignore NEAR for this long after a sweep
+```
+
 ## Quick test plan
 
 1. Power the L298N from the battery; ESP32 from USB during bring-up.
-   Tie all grounds together.
+   Tie all grounds together (battery, L298N, ESP32, BFD1000, servo, camera).
 2. Lift the chassis so the wheels can spin freely.
-3. Flash, open Serial Monitor at 115200, and watch the boot self-test.
+3. Flash both boards (camera and robot). Open Serial Monitor on the robot
+   side at 115200 and watch the boot self-test.
 4. After the self-test, slide the bot over a black tape strip and wave a
    hand in front of NEAR - the printed `line=[#####]` and `obst=` columns
-   should react.
-5. Once everything looks right, set `ENABLE_LINE_FOLLOW = true`, re-upload,
-   and put it on a track.
+   should react. The `cam=` field should show `red` / `green` / `yellow`
+   / `none` based on what the camera sees.
+5. Place a coloured ball directly under the NEAR sensor:
+   - red / yellow -> servo sweeps to `SERVO_ACTUATED_ANGLE` and back.
+   - green / none -> servo stays put.
+6. Put the bot on a 3.5 cm black line track and let it follow.
 
 ---
 

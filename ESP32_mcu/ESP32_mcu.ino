@@ -40,11 +40,20 @@
 //   ESP32 SCL (GPIO22) -> camera IIC SCL
 //   GND               <-> camera GND   (common ground required!)
 // Camera publishes 5 bytes from register 0x00:
-//   [0] dominant code: 0=none, 1=red, 2=green, 3=black
-//   [1] red %      [2] green %    [3] black %    [4] confidence %
+//   [0] dominant code: 0=none, 1=red, 2=green, 3=yellow
+//   [1] red %      [2] green %    [3] yellow %    [4] confidence %
+//
+// Servo (signal pin only)
+//   SIG -> GPIO23
+//   V+  -> battery + (5 V); not from ESP32 3V3
+//   GND -> battery -, common with ESP32 GND
+// Behaviour: when the BFD1000 NEAR pin says a ball is in front of us we
+// stop, ask the camera what colour it is, and sweep the servo for red or
+// yellow. Green or no colour => no actuation.
 // =====================================================================
 
 #include <Wire.h>
+#include <ESP32Servo.h>
 
 #define IN1 13
 #define IN2 19
@@ -72,10 +81,17 @@
 #define I2C_FREQ_HZ     100000
 #define CAM_POLL_MS     200
 
+// ---------- Servo (ESP32Servo library) ----------
+#define SERVO_PIN              23
+#define SERVO_REST_ANGLE        0    // deg, idle position
+#define SERVO_ACTUATED_ANGLE   90    // deg, "fire" position
+#define SERVO_HOLD_MS         500    // hold at actuated angle
+#define SERVO_RETURN_MS       250    // settle back at rest
+#define NEAR_COOLDOWN_MS     1500    // ignore NEAR for this long after a sweep
+
 // ---------- behaviour switches ----------
 const bool ENABLE_BOOT_MOTOR_TEST = true;   // drive a short sequence on power-up
-const bool ENABLE_LINE_FOLLOW     = false;  // flip to true after the wiring is verified
-const bool ENABLE_COLOR_REACTION  = false;  // act on color from the camera (red=stop, green=go)
+const bool ENABLE_LINE_FOLLOW     = true;   // primary mode: follow the 3.5 cm black line
 const uint32_t SERIAL_PRINT_MS    = 200;
 
 // =====================================================================
@@ -125,10 +141,10 @@ inline bool onLine(int v)        { return v == LINE_ACTIVE_LEVEL; }
 inline bool obstacleClose(int v) { return v == OBSTACLE_ACTIVE_LEVEL; }
 
 // Latest result from the camera over I2C.
-uint8_t camDominant   = 0;   // 0=none, 1=red, 2=green, 3=black
+uint8_t camDominant   = 0;   // 0=none, 1=red, 2=green, 3=yellow
 uint8_t camRed        = 0;   // %
 uint8_t camGreen      = 0;   // %
-uint8_t camBlack      = 0;   // %
+uint8_t camYellow     = 0;   // %
 uint8_t camConfidence = 0;   // %
 bool    camValid      = false;
 
@@ -136,7 +152,7 @@ const char* colorName(uint8_t code) {
   switch (code) {
     case 1: return "red";
     case 2: return "green";
-    case 3: return "black";
+    case 3: return "yellow";
     default: return "none";
   }
 }
@@ -153,9 +169,31 @@ void pollCamera() {
   camDominant   = Wire.read();
   camRed        = Wire.read();
   camGreen      = Wire.read();
-  camBlack      = Wire.read();
+  camYellow     = Wire.read();
   camConfidence = Wire.read();
   camValid      = true;
+}
+
+// =====================================================================
+//                        SERVO (ESP32Servo)
+// =====================================================================
+Servo gServo;
+uint32_t lastSweepEndMs = 0;   // when the last actuation cycle finished
+
+void servoInit() {
+  // The ESP32Servo library wants a periodHertz set before attach() so the
+  // PWM timing matches a hobby servo (50 Hz, ~1-2 ms pulse).
+  gServo.setPeriodHertz(50);
+  gServo.attach(SERVO_PIN, 500, 2400);   // microseconds for 0..180 deg
+  gServo.write(SERVO_REST_ANGLE);
+}
+
+void servoActuate() {
+  gServo.write(SERVO_ACTUATED_ANGLE);
+  delay(SERVO_HOLD_MS);
+  gServo.write(SERVO_REST_ANGLE);
+  delay(SERVO_RETURN_MS);
+  lastSweepEndMs = millis();
 }
 
 // =====================================================================
@@ -180,6 +218,11 @@ void setup() {
   Serial.printf("I2C master ready, polling camera @0x%02X on SDA=%d SCL=%d\n",
                 CAM_I2C_ADDR, I2C_SDA_PIN, I2C_SCL_PIN);
 
+  // Servo on GPIO 23, parked at rest.
+  servoInit();
+  Serial.printf("Servo on GPIO%d at %d deg (actuates to %d deg on red/yellow ball)\n",
+                SERVO_PIN, SERVO_REST_ANGLE, SERVO_ACTUATED_ANGLE);
+
   if (ENABLE_BOOT_MOTOR_TEST) {
     Serial.println("Motor self-test starting...");
     Serial.println(" -> forward 600 ms");
@@ -195,8 +238,7 @@ void setup() {
 
   Serial.print("Line follow mode: ");
   Serial.println(ENABLE_LINE_FOLLOW ? "ENABLED" : "disabled (sensor-monitor only)");
-  Serial.print("Color reaction:   ");
-  Serial.println(ENABLE_COLOR_REACTION ? "ENABLED" : "disabled");
+  Serial.println("Ball reaction:    NEAR + camera color (red/yellow -> servo)");
 }
 
 // =====================================================================
@@ -226,35 +268,35 @@ void loop() {
                   obstacleClose(sensNEAR) ? 'X' : '.',
                   camValid ? colorName(camDominant) : "??");
     if (camValid) {
-      Serial.printf(" R=%u G=%u K=%u conf=%u\n",
-                    camRed, camGreen, camBlack, camConfidence);
+      Serial.printf(" R=%u G=%u Y=%u conf=%u\n",
+                    camRed, camGreen, camYellow, camConfidence);
     } else {
       Serial.println();
     }
   }
 
-  // ---- optional: react to color seen by the camera ----
-  // Example mapping: red -> stop, green -> drive forward, anything else -> defer
-  // to the line follower or stop. Tweak this block to taste.
-  if (ENABLE_COLOR_REACTION && camValid && camConfidence >= 5) {
-    if (camDominant == 1) {              // red
-      stopMotors();
-      return;
-    }
-    if (camDominant == 2) {              // green
-      driveForward();
-      return;
-    }
-    // camDominant == 3 (black) or 0 (none): fall through to line follower / stop.
-  }
-
-  if (!ENABLE_LINE_FOLLOW) {
+  // ---- ball detected by NEAR? ----
+  // When the BFD1000 NEAR pin is active the bot is parked in front of a
+  // ball. Stop, ask the camera what colour it is *right now*, and decide.
+  // A short cooldown after every action prevents re-triggering on the
+  // same ball while we drive past it.
+  if (obstacleClose(sensNEAR) &&
+      millis() - lastSweepEndMs > NEAR_COOLDOWN_MS) {
     stopMotors();
+    pollCamera();   // force-refresh so we act on the current frame
+    if (camValid && (camDominant == 1 || camDominant == 3)) {
+      Serial.printf("Ball: %s -> ACTUATE\n", colorName(camDominant));
+      servoActuate();
+    } else {
+      Serial.printf("Ball: %s -> skip\n",
+                    camValid ? colorName(camDominant) : "??");
+      lastSweepEndMs = millis();   // arm the cooldown anyway
+    }
     return;
   }
 
-  // Stop if something is right in front of us.
-  if (obstacleClose(sensNEAR)) {
+  // ---- line follow on the 3.5 cm black line ----
+  if (!ENABLE_LINE_FOLLOW) {
     stopMotors();
     return;
   }

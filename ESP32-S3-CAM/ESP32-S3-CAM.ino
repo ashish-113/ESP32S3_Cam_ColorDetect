@@ -1,4 +1,4 @@
-// ESP32-S3-CAM: live stream + red/green/black color detection
+// ESP32-S3-CAM: live stream + red/green/yellow color detection
 // Tested on Hiwonder / ThinkRobotics ESP32-S3-CAM AI Vision Module
 // Arduino IDE 2.3.7, esp32 core 2.0.17
 // See README.md for required Tools-menu settings.
@@ -48,28 +48,18 @@ const IPAddress AP_SN (255,255,255,0);
 WebServer server(80);
 
 struct Detection {
-  float red = 0, green = 0, black = 0;
+  float red = 0, green = 0, yellow = 0;
   const char* dominant = "none";
   float confidence = 0;
 } det;
 
 // ---------- I2C publish buffer ----------
-//
-// Wire protocol (this board is the slave, address I2C_SLAVE_ADDR = 0x52):
-//   master -> slave : 1-byte register address (only 0x00 supported)
-//   master <- slave : 5 bytes when register == 0x00:
-//     [0] dominant code (0=none, 1=red, 2=green, 3=black)
-//     [1] red %      (0..100)
-//     [2] green %    (0..100)
-//     [3] black %    (0..100)
-//     [4] confidence (0..100)   = the dominant class' percentage
-//
-// Wire example on the master side (Arduino-style):
-//   Wire.beginTransmission(0x52); Wire.write(0x00); Wire.endTransmission();
-//   Wire.requestFrom(0x52, 5);
-//   uint8_t dom = Wire.read(); uint8_t r = Wire.read(); ...
-//
-// The five bytes are refreshed once per analyzed frame inside handleJpg().
+// Five bytes that an external I2C master can read from register 0x00:
+//   [0] dominant code (0=none, 1=red, 2=green, 3=yellow)
+//   [1] red %      (0..100)
+//   [2] green %    (0..100)
+//   [3] yellow %   (0..100)
+//   [4] confidence (0..100)
 volatile uint8_t pubBuf[5] = {0, 0, 0, 0, 0};
 volatile uint8_t i2cReg    = 0;
 
@@ -81,10 +71,10 @@ static inline uint8_t clamp100(float v) {
 }
 
 static uint8_t dominantCode() {
-  if (det.confidence < 1.0f)               return 0;
-  if (strcmp(det.dominant, "red")   == 0)  return 1;
-  if (strcmp(det.dominant, "green") == 0)  return 2;
-  if (strcmp(det.dominant, "black") == 0)  return 3;
+  if (det.confidence < 1.0f)                return 0;
+  if (strcmp(det.dominant, "red")    == 0)  return 1;
+  if (strcmp(det.dominant, "green")  == 0)  return 2;
+  if (strcmp(det.dominant, "yellow") == 0)  return 3;
   return 0;
 }
 
@@ -92,7 +82,7 @@ static void publishDetection() {
   pubBuf[0] = dominantCode();
   pubBuf[1] = clamp100(det.red);
   pubBuf[2] = clamp100(det.green);
-  pubBuf[3] = clamp100(det.black);
+  pubBuf[3] = clamp100(det.yellow);
   pubBuf[4] = clamp100(det.confidence);
 }
 
@@ -112,27 +102,29 @@ void onI2CRequest() {
 }
 
 // ---------- Color classification ----------
+// Returns: 0=other, 1=red, 2=green, 3=yellow
 static inline uint8_t classify(uint8_t r, uint8_t g, uint8_t b) {
   uint8_t maxc = r > g ? (r > b ? r : b) : (g > b ? g : b);
   uint8_t minc = r < g ? (r < b ? r : b) : (g < b ? g : b);
   uint8_t v = maxc;
-  if (v < 55) return 3;                          // black
   uint8_t delta = maxc - minc;
   if (delta == 0) return 0;
   uint8_t s = (uint16_t)delta * 255 / maxc;
-  if (s < 85 || v < 60) return 0;                // too gray / dark
+  // Need a saturated, decently bright pixel to be a "color".
+  if (s < 85 || v < 70) return 0;
   float h;
   if (maxc == r)      h = 60.0f * ((float)(g - b) / delta);
   else if (maxc == g) h = 60.0f * (2.0f + (float)(b - r) / delta);
   else                h = 60.0f * (4.0f + (float)(r - g) / delta);
   if (h < 0) h += 360;
-  if (h < 20 || h > 340) return 1;               // red
-  if (h > 85 && h < 170) return 2;               // green
+  if (h < 20  || h > 340)  return 1;             // red    (~ 0  deg)
+  if (h > 40  && h < 70)   return 3;             // yellow (~ 60 deg)
+  if (h > 85  && h < 170)  return 2;             // green  (~120 deg)
   return 0;
 }
 
 static void analyzeRGB565(const uint8_t* buf, int w, int h) {
-  uint32_t red = 0, green = 0, black = 0, total = 0;
+  uint32_t red = 0, green = 0, yellow = 0, total = 0;
   for (int y = 0; y < h; y += 2) {
     for (int x = 0; x < w; x += 2) {
       int i = (y * w + x) * 2;
@@ -142,18 +134,18 @@ static void analyzeRGB565(const uint8_t* buf, int w, int h) {
       uint8_t b = ( p        & 0x1F) << 3;
       uint8_t c = classify(r, g, b);
       total++;
-      if (c == 1) red++;
+      if      (c == 1) red++;
       else if (c == 2) green++;
-      else if (c == 3) black++;
+      else if (c == 3) yellow++;
     }
   }
   if (!total) return;
-  det.red   = 100.0f * red   / total;
-  det.green = 100.0f * green / total;
-  det.black = 100.0f * black / total;
-  float best = det.red; det.dominant = "red"; det.confidence = det.red;
-  if (det.green > best) { best = det.green; det.dominant = "green"; det.confidence = det.green; }
-  if (det.black > best) { best = det.black; det.dominant = "black"; det.confidence = det.black; }
+  det.red    = 100.0f * red    / total;
+  det.green  = 100.0f * green  / total;
+  det.yellow = 100.0f * yellow / total;
+  float best = det.red; det.dominant = "red";    det.confidence = det.red;
+  if (det.green  > best) { best = det.green;  det.dominant = "green";  det.confidence = det.green;  }
+  if (det.yellow > best) { best = det.yellow; det.dominant = "yellow"; det.confidence = det.yellow; }
   if (best < 2.0f) { det.dominant = "none"; det.confidence = 0; }
 }
 
@@ -170,7 +162,7 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
   .big{font-size:28px;font-weight:700}
   .bar{height:8px;background:#333;border-radius:4px;margin-top:6px;overflow:hidden}
   .fill{height:100%;width:0;transition:width .2s}
-  .red .fill{background:#ef4444}.green .fill{background:#22c55e}.black .fill{background:#9ca3af}
+  .red .fill{background:#ef4444}.green .fill{background:#22c55e}.yellow .fill{background:#facc15}
   .dom{margin-top:10px;font-size:18px}
 </style></head><body>
 <h2>ESP32-S3-CAM &bull; live + color detection</h2>
@@ -179,7 +171,7 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
 <div class="row">
   <div class="card red">Red <div class="big"><span id="r">0</span>%</div><div class="bar"><div class="fill" id="rb"></div></div></div>
   <div class="card green">Green <div class="big"><span id="g">0</span>%</div><div class="bar"><div class="fill" id="gb"></div></div></div>
-  <div class="card black">Black <div class="big"><span id="k">0</span>%</div><div class="bar"><div class="fill" id="kb"></div></div></div>
+  <div class="card yellow">Yellow <div class="big"><span id="y">0</span>%</div><div class="bar"><div class="fill" id="yb"></div></div></div>
 </div>
 <script>
   const img = document.getElementById('cam');
@@ -195,10 +187,10 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
       const j = await r.json();
       document.getElementById('r').textContent = j.red.toFixed(1);
       document.getElementById('g').textContent = j.green.toFixed(1);
-      document.getElementById('k').textContent = j.black.toFixed(1);
+      document.getElementById('y').textContent = j.yellow.toFixed(1);
       document.getElementById('rb').style.width = Math.min(100,j.red)+'%';
       document.getElementById('gb').style.width = Math.min(100,j.green)+'%';
-      document.getElementById('kb').style.width = Math.min(100,j.black)+'%';
+      document.getElementById('yb').style.width = Math.min(100,j.yellow)+'%';
       document.getElementById('dom').textContent = j.dominant;
       document.getElementById('conf').textContent = j.confidence.toFixed(1);
     }catch(e){}
@@ -214,8 +206,8 @@ void handleRoot() { server.send_P(200, "text/html", INDEX_HTML); }
 void handleStatus() {
   char buf[192];
   snprintf(buf, sizeof(buf),
-    "{\"red\":%.2f,\"green\":%.2f,\"black\":%.2f,\"dominant\":\"%s\",\"confidence\":%.2f}",
-    det.red, det.green, det.black, det.dominant, det.confidence);
+    "{\"red\":%.2f,\"green\":%.2f,\"yellow\":%.2f,\"dominant\":\"%s\",\"confidence\":%.2f}",
+    det.red, det.green, det.yellow, det.dominant, det.confidence);
   server.sendHeader("Cache-Control", "no-store");
   server.send(200, "application/json", buf);
 }
@@ -336,19 +328,10 @@ void setup() {
 void loop() {
   server.handleClient();
 
-  // Once per second, print the detection plus the bytes a master would read
-  // over I2C from register 0x00. Useful for verifying the link without
-  // actually hooking up a master.
   static uint32_t lastLog = 0;
   if (millis() - lastLog > 1000) {
     lastLog = millis();
-    const char* domNames[4] = {"none", "red", "green", "black"};
-    uint8_t dc = pubBuf[0] < 4 ? pubBuf[0] : 0;
-    Serial.printf("R=%.1f%% G=%.1f%% K=%.1f%% dom=%s (%.1f%%) | "
-                  "i2c@0x%02X reg0x00 -> [%u,%u,%u,%u,%u] (%s)\n",
-                  det.red, det.green, det.black, det.dominant, det.confidence,
-                  I2C_SLAVE_ADDR,
-                  pubBuf[0], pubBuf[1], pubBuf[2], pubBuf[3], pubBuf[4],
-                  domNames[dc]);
+    Serial.printf("R=%.1f%% G=%.1f%% Y=%.1f%% dom=%s (%.1f%%)\n",
+                  det.red, det.green, det.yellow, det.dominant, det.confidence);
   }
 }
