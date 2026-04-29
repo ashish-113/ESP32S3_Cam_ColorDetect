@@ -101,40 +101,36 @@ void turnRight()     { leftMotor(+1); rightMotor(-1); }
 void stopMotors()    { leftMotor( 0); rightMotor( 0); }
 
 // =====================================================================
-//                         SENSOR HELPERS
+//                  SENSOR + CAMERA STATE (globals)
 // =====================================================================
-struct SensorReadings {
-  int s1, s2, s3, s4, s5;   // raw digitalRead for each line sensor
-  int near_;                // raw digitalRead for the NEAR / proximity output
-};
+// NOTE: These helpers fill global state instead of returning user-defined
+// structs by value. This avoids the Arduino IDE 2.x auto-prototype bug,
+// where the IDE inserts function prototypes before struct definitions
+// and then complains "'SensorReadings' does not name a type".
 
-SensorReadings readSensors() {
-  SensorReadings r;
-  r.s1    = digitalRead(S1);
-  r.s2    = digitalRead(S2);
-  r.s3    = digitalRead(S3);
-  r.s4    = digitalRead(S4);
-  r.s5    = digitalRead(S5);
-  r.near_ = digitalRead(NEAR);
-  return r;
+// Line / obstacle sensor snapshot.
+int  sensS1 = 0, sensS2 = 0, sensS3 = 0, sensS4 = 0, sensS5 = 0;
+int  sensNEAR = 0;
+
+void readSensors() {
+  sensS1   = digitalRead(S1);
+  sensS2   = digitalRead(S2);
+  sensS3   = digitalRead(S3);
+  sensS4   = digitalRead(S4);
+  sensS5   = digitalRead(S5);
+  sensNEAR = digitalRead(NEAR);
 }
 
 inline bool onLine(int v)        { return v == LINE_ACTIVE_LEVEL; }
 inline bool obstacleClose(int v) { return v == OBSTACLE_ACTIVE_LEVEL; }
 
-// =====================================================================
-//                    CAMERA I2C CLIENT (read color)
-// =====================================================================
-struct CamColor {
-  uint8_t dominant;     // 0=none, 1=red, 2=green, 3=black
-  uint8_t red;          // %
-  uint8_t green;        // %
-  uint8_t black;        // %
-  uint8_t confidence;   // %
-  bool    valid;        // true if last poll succeeded
-};
-
-CamColor lastCam = {0, 0, 0, 0, 0, false};
+// Latest result from the camera over I2C.
+uint8_t camDominant   = 0;   // 0=none, 1=red, 2=green, 3=black
+uint8_t camRed        = 0;   // %
+uint8_t camGreen      = 0;   // %
+uint8_t camBlack      = 0;   // %
+uint8_t camConfidence = 0;   // %
+bool    camValid      = false;
 
 const char* colorName(uint8_t code) {
   switch (code) {
@@ -145,29 +141,21 @@ const char* colorName(uint8_t code) {
   }
 }
 
-// Read the camera's "summary" register (0x00).
-// Returns CamColor{ valid=false } when the camera is not responding (wrong
-// address, broken wire, missing common ground, etc.) - keep an eye on the
-// serial log: `cam=??` means the master got nothing back.
-CamColor pollCamera() {
-  CamColor c = {0, 0, 0, 0, 0, false};
-
-  // Step 1: tell the slave which register we want.
+void pollCamera() {
+  camValid = false;
   Wire.beginTransmission(CAM_I2C_ADDR);
-  Wire.write((uint8_t)0x00);
-  if (Wire.endTransmission() != 0) return c;    // ack failed
+  Wire.write((uint8_t)0x00);                    // request "summary" register
+  if (Wire.endTransmission() != 0) return;      // camera not responding
 
-  // Step 2: read 5 bytes of detection back.
   uint8_t got = Wire.requestFrom((uint8_t)CAM_I2C_ADDR, (uint8_t)5);
-  if (got != 5) return c;
+  if (got != 5) return;
 
-  c.dominant   = Wire.read();
-  c.red        = Wire.read();
-  c.green      = Wire.read();
-  c.black      = Wire.read();
-  c.confidence = Wire.read();
-  c.valid      = true;
-  return c;
+  camDominant   = Wire.read();
+  camRed        = Wire.read();
+  camGreen      = Wire.read();
+  camBlack      = Wire.read();
+  camConfidence = Wire.read();
+  camValid      = true;
 }
 
 // =====================================================================
@@ -215,13 +203,13 @@ void setup() {
 //                              LOOP
 // =====================================================================
 void loop() {
-  SensorReadings s = readSensors();
+  readSensors();
 
   // ---- poll camera over I2C every CAM_POLL_MS ----
   static uint32_t lastPoll = 0;
   if (millis() - lastPoll > CAM_POLL_MS) {
     lastPoll = millis();
-    lastCam = pollCamera();
+    pollCamera();
   }
 
   // ---- periodic serial dump (sensors + camera color) ----
@@ -229,17 +217,17 @@ void loop() {
   if (millis() - lastPrint > SERIAL_PRINT_MS) {
     lastPrint = millis();
     Serial.printf("S1=%d S2=%d S3=%d S4=%d S5=%d  NEAR=%d  line=[%c%c%c%c%c] obst=%c | cam=%s",
-                  s.s1, s.s2, s.s3, s.s4, s.s5, s.near_,
-                  onLine(s.s1) ? '#' : '.',
-                  onLine(s.s2) ? '#' : '.',
-                  onLine(s.s3) ? '#' : '.',
-                  onLine(s.s4) ? '#' : '.',
-                  onLine(s.s5) ? '#' : '.',
-                  obstacleClose(s.near_) ? 'X' : '.',
-                  lastCam.valid ? colorName(lastCam.dominant) : "??");
-    if (lastCam.valid) {
+                  sensS1, sensS2, sensS3, sensS4, sensS5, sensNEAR,
+                  onLine(sensS1) ? '#' : '.',
+                  onLine(sensS2) ? '#' : '.',
+                  onLine(sensS3) ? '#' : '.',
+                  onLine(sensS4) ? '#' : '.',
+                  onLine(sensS5) ? '#' : '.',
+                  obstacleClose(sensNEAR) ? 'X' : '.',
+                  camValid ? colorName(camDominant) : "??");
+    if (camValid) {
       Serial.printf(" R=%u G=%u K=%u conf=%u\n",
-                    lastCam.red, lastCam.green, lastCam.black, lastCam.confidence);
+                    camRed, camGreen, camBlack, camConfidence);
     } else {
       Serial.println();
     }
@@ -248,16 +236,16 @@ void loop() {
   // ---- optional: react to color seen by the camera ----
   // Example mapping: red -> stop, green -> drive forward, anything else -> defer
   // to the line follower or stop. Tweak this block to taste.
-  if (ENABLE_COLOR_REACTION && lastCam.valid && lastCam.confidence >= 5) {
-    if (lastCam.dominant == 1) {        // red
+  if (ENABLE_COLOR_REACTION && camValid && camConfidence >= 5) {
+    if (camDominant == 1) {              // red
       stopMotors();
       return;
     }
-    if (lastCam.dominant == 2) {        // green
+    if (camDominant == 2) {              // green
       driveForward();
       return;
     }
-    // dominant == 3 (black) or 0 (none): fall through to line follower / stop.
+    // camDominant == 3 (black) or 0 (none): fall through to line follower / stop.
   }
 
   if (!ENABLE_LINE_FOLLOW) {
@@ -266,15 +254,15 @@ void loop() {
   }
 
   // Stop if something is right in front of us.
-  if (obstacleClose(s.near_)) {
+  if (obstacleClose(sensNEAR)) {
     stopMotors();
     return;
   }
 
   // Simple 5-channel bang-bang line follower.
   // Assumes S1 is leftmost on the chassis and S5 is rightmost (swap macros if reversed).
-  bool L1 = onLine(s.s1), L2 = onLine(s.s2), L3 = onLine(s.s3),
-       L4 = onLine(s.s4), L5 = onLine(s.s5);
+  bool L1 = onLine(sensS1), L2 = onLine(sensS2), L3 = onLine(sensS3),
+       L4 = onLine(sensS4), L5 = onLine(sensS5);
 
   if (L3 && !L1 && !L5) {
     driveForward();                  // line is centred
