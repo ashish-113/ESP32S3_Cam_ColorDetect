@@ -199,9 +199,12 @@ static uint8_t dbgI2cBusScan(const char* tag, bool printHits) {
 
 void pollCamera() {
   camValid = false;
+  // Write register pointer with repeated START (no STOP) then read 5 bytes in the
+  // same transaction group. Some ESP32-S3 Wire slaves never see a clean read if
+  // the master inserts a STOP between write and read.
   Wire.beginTransmission(CAM_I2C_ADDR);
-  Wire.write((uint8_t)0x00);                    // request "summary" register
-  uint8_t tx = Wire.endTransmission();
+  Wire.write((uint8_t)0x00);
+  uint8_t tx = Wire.endTransmission(false);
   if (tx != 0) {
     // #region agent log
     // tx=4 "other error" observed in field: floating SDA/SCL, wrong slave pins,
@@ -212,14 +215,15 @@ void pollCamera() {
     if (millis() - lastTxErr > 2000) {
       lastTxErr = millis();
       Serial.printf(
-        "DBG|poll_tx_err|hypothesisId=H_poll_tx|tx=%u|tx_meaning=%s|addr=0x%02X|reg=0x00\n",
+        "DBG|poll_tx_err|hypothesisId=H_poll_tx|seq=RS|tx=%u|tx_meaning=%s|addr=0x%02X|reg=0x00\n",
         tx, i2cEndTxExplain(tx), CAM_I2C_ADDR);
     }
     // #endregion
     return;
   }
 
-  uint8_t got = Wire.requestFrom((uint8_t)CAM_I2C_ADDR, (uint8_t)5);
+  // Third arg: send STOP after clocking bytes so the slave releases the bus.
+  uint8_t got = Wire.requestFrom((uint8_t)CAM_I2C_ADDR, (uint8_t)5, (uint8_t)1);
   if (got != 5) {
     // #region agent log
     // Address ACKed but slave returned wrong byte count.
@@ -293,12 +297,13 @@ void setup() {
 
   // I2C master on default ESP32 pins (21=SDA, 22=SCL).
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN, (uint32_t)I2C_FREQ_HZ);
-  // Reinforce idle-high on marginal breadboards (prefer 4.7k external pull-ups
-  // to 3V3).
-  pinMode(I2C_SDA_PIN, INPUT_PULLUP);
-  pinMode(I2C_SCL_PIN, INPUT_PULLUP);
+  // Do NOT pinMode() these GPIOs after Wire.begin — that can drop the peripheral
+  // back into plain GPIO INPUT and yield Wire error codes like tx=4. Use external
+  // 4.7kΩ to 3.3V pull-ups when the slave does not supply them.
+
   Serial.printf("I2C master ready, polling camera @0x%02X on SDA=%d SCL=%d\n",
                 CAM_I2C_ADDR, I2C_SDA_PIN, I2C_SCL_PIN);
+  Serial.println("DBG|i2c_master_mode|hypothesisId=H_rs|burst=repeated_start");
 
   // #region agent log
   dbgI2cBusScan("boot", true);
