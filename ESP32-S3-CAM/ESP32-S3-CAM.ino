@@ -37,10 +37,8 @@ const IPAddress AP_SN (255,255,255,0);
 //   ALT 5    : SDA=42, SCL=41
 //
 // Avoid GPIO 19/20 (USB D-/D+) and 35/36/37 (PSRAM on octal-PSRAM modules).
-// To verify a pair: flash camera, flash robot, look at robot Serial for
-// `DBG|i2c_scan_hit|addr=0x52`. If you see that, the pair is correct.
-// The camera-side `DBG|cam_i2c_req_count|n=...` line should also start
-// climbing above 0 once the master polls successfully.
+// If the robot never reads valid camera bytes, try another SDA/SCL pair from
+// the list above (wiring or silkscreen may not match "PRIMARY").
 #define I2C_SLAVE_ADDR  0x52
 #define I2C_SDA_PIN     1
 #define I2C_SCL_PIN     2
@@ -89,16 +87,6 @@ struct Detection {
 volatile uint8_t pubBuf[5] = {0, 0, 0, 0, 0};
 volatile uint8_t i2cReg    = 0;
 
-// #region agent log
-// Counter incremented inside onI2CRequest() (interrupt context). The main
-// loop prints this once per second so we can tell whether ANY master
-// transaction is actually reaching this slave. If n stays at 0 while the
-// robot is powered, the bus literally isn't reaching the camera (wrong
-// SDA/SCL pins, no common GND, or wires not seated).
-volatile uint32_t i2cReqCount = 0;
-volatile uint32_t i2cRecvCount = 0;
-// #endregion
-
 static inline uint8_t clamp100(float v) {
   int x = (int)roundf(v);
   if (x < 0)   x = 0;
@@ -124,17 +112,11 @@ static void publishDetection() {
 
 // I2C slave callbacks. Keep these tiny - they run in interrupt context.
 void onI2CReceive(int n) {
-  // #region agent log
-  i2cRecvCount++;
-  // #endregion
   if (n >= 1) i2cReg = Wire.read();
   while (Wire.available()) Wire.read();
 }
 
 void onI2CRequest() {
-  // #region agent log
-  i2cReqCount++;
-  // #endregion
   if (i2cReg == 0x00) {
     Wire.write((const uint8_t*)pubBuf, 5);
   } else {
@@ -192,25 +174,11 @@ static void analyzeRGB565(const uint8_t* buf, int w, int h) {
 }
 
 // ---------- Independent detection (not tied to HTTP) ----------
-// #region agent log
-static uint32_t dbgDetectFbOk   = 0;
-static uint32_t dbgDetectFbFail = 0;
-static int      dbgLastW = 0, dbgLastH = 0;
-// #endregion
-
 static void runDetectionCycle() {
   camera_fb_t* fb = esp_camera_fb_get();
   if (!fb) {
-    // #region agent log
-    dbgDetectFbFail++;
-    // #endregion
     return;
   }
-  // #region agent log
-  dbgDetectFbOk++;
-  dbgLastW = fb->width;
-  dbgLastH = fb->height;
-  // #endregion
 
   if (fb->format == PIXFORMAT_RGB565) {
     analyzeRGB565(fb->buf, fb->width, fb->height);
@@ -292,13 +260,6 @@ void handleJpg() {
   size_t   jpg_len = 0;
   bool ok = frame2jpg(fb, JPG_QUALITY, &jpg_buf, &jpg_len);
   esp_camera_fb_return(fb);
-
-  // #region agent log
-  if (!ok) {
-    Serial.printf("DBG|jpg_encode_fail|hypothesisId=jpg_heap|heap=%u\n",
-                  (unsigned)ESP.getFreeHeap());
-  }
-  // #endregion
 
   if (!ok) { server.send(500, "text/plain", "encode failed"); return; }
 
@@ -391,13 +352,6 @@ void setup() {
   Serial.printf("I2C slave at 0x%02X on SDA=%d SCL=%d\n",
                 I2C_SLAVE_ADDR, I2C_SDA_PIN, I2C_SCL_PIN);
 
-  // #region agent log
-  // Print a structured marker so the bridge log can prove the slave actually
-  // came up with the pins we expected (vs. Wire.begin silently failing).
-  Serial.printf("DBG|cam_i2c_slave_started|sda=%d|scl=%d|addr=0x%02X\n",
-                I2C_SDA_PIN, I2C_SCL_PIN, I2C_SLAVE_ADDR);
-  // #endregion
-
   server.on("/",       handleRoot);
   server.on("/jpg",    handleJpg);
   server.on("/status", handleStatus);
@@ -420,22 +374,5 @@ void loop() {
     lastLog = millis();
     Serial.printf("R=%.1f%% G=%.1f%% Y=%.1f%% dom=%s (%.1f%%)\n",
                   det.red, det.green, det.yellow, det.dominant, det.confidence);
-
-    // #region agent log
-    // Snapshot ISR counters + detection health once per second.
-    // hypothesisId meanings: H1=I2C not wired; H2=fb_get starvation; H3=...
-    noInterrupts();
-    uint32_t reqs  = i2cReqCount;
-    uint32_t recvs = i2cRecvCount;
-    interrupts();
-    uint32_t fbOk   = dbgDetectFbOk;
-    uint32_t fbFail = dbgDetectFbFail;
-    Serial.printf("DBG|cam_i2c_req_count|hypothesisId=H1_i2c_wiring|n=%lu|recv=%lu\n",
-                  (unsigned long)reqs, (unsigned long)recvs);
-    Serial.printf(
-      "DBG|detect_health|hypothesisId=H2_detection_loop|fb_ok=%lu|fb_fail=%lu|w=%d|h=%d|heap=%u\n",
-      (unsigned long)fbOk, (unsigned long)fbFail, dbgLastW, dbgLastH,
-      (unsigned)ESP.getFreeHeap());
-    // #endregion
   }
 }
