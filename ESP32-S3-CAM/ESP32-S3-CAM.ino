@@ -46,6 +46,13 @@ const IPAddress AP_SN (255,255,255,0);
 #define I2C_SCL_PIN     2
 #define I2C_FREQ_HZ     100000
 
+// Color detection + I2C publish run in loop() at this interval, independent
+// of the web app. Slightly slower than /jpg polling reduces camera contention.
+#define CAM_DETECT_INTERVAL_MS  100
+
+// JPEG quality for /jpg (lower => smaller heap peak, fewer malloc failures).
+#define JPG_QUALITY  65
+
 // ---------- Pin map: Hiwonder / NullLab ESP32-S3-CAM ----------
 #define PWDN_GPIO_NUM   -1
 #define RESET_GPIO_NUM  -1
@@ -184,6 +191,34 @@ static void analyzeRGB565(const uint8_t* buf, int w, int h) {
   if (best < 2.0f) { det.dominant = "none"; det.confidence = 0; }
 }
 
+// ---------- Independent detection (not tied to HTTP) ----------
+// #region agent log
+static uint32_t dbgDetectFbOk   = 0;
+static uint32_t dbgDetectFbFail = 0;
+static int      dbgLastW = 0, dbgLastH = 0;
+// #endregion
+
+static void runDetectionCycle() {
+  camera_fb_t* fb = esp_camera_fb_get();
+  if (!fb) {
+    // #region agent log
+    dbgDetectFbFail++;
+    // #endregion
+    return;
+  }
+  // #region agent log
+  dbgDetectFbOk++;
+  dbgLastW = fb->width;
+  dbgLastH = fb->height;
+  // #endregion
+
+  if (fb->format == PIXFORMAT_RGB565) {
+    analyzeRGB565(fb->buf, fb->width, fb->height);
+    publishDetection();
+  }
+  esp_camera_fb_return(fb);
+}
+
 // ---------- HTTP handlers ----------
 
 static const char INDEX_HTML[] PROGMEM = R"HTML(
@@ -251,15 +286,19 @@ void handleJpg() {
   camera_fb_t* fb = esp_camera_fb_get();
   if (!fb) { server.send(500, "text/plain", "capture failed"); return; }
 
-  if (fb->format == PIXFORMAT_RGB565) {
-    analyzeRGB565(fb->buf, fb->width, fb->height);
-    publishDetection();
-  }
+  // Detection + I2C update run continuously in loop(); here we only JPEG-encode.
 
   uint8_t* jpg_buf = nullptr;
   size_t   jpg_len = 0;
-  bool ok = frame2jpg(fb, 80, &jpg_buf, &jpg_len);
+  bool ok = frame2jpg(fb, JPG_QUALITY, &jpg_buf, &jpg_len);
   esp_camera_fb_return(fb);
+
+  // #region agent log
+  if (!ok) {
+    Serial.printf("DBG|jpg_encode_fail|hypothesisId=jpg_heap|heap=%u\n",
+                  (unsigned)ESP.getFreeHeap());
+  }
+  // #endregion
 
   if (!ok) { server.send(500, "text/plain", "encode failed"); return; }
 
@@ -370,6 +409,12 @@ void setup() {
 void loop() {
   server.handleClient();
 
+  static uint32_t lastDetect = 0;
+  if ((int32_t)(millis() - lastDetect) >= (int32_t)CAM_DETECT_INTERVAL_MS) {
+    lastDetect = millis();
+    runDetectionCycle();
+  }
+
   static uint32_t lastLog = 0;
   if (millis() - lastLog > 1000) {
     lastLog = millis();
@@ -377,16 +422,20 @@ void loop() {
                   det.red, det.green, det.yellow, det.dominant, det.confidence);
 
     // #region agent log
-    // Snapshot the volatile ISR counters once per second. If recv stays 0
-    // the robot's address byte never arrives. If recv > 0 but req stays 0
-    // the master is writing but never doing requestFrom() (would imply a
-    // bug on the master side, not a wiring problem).
+    // Snapshot ISR counters + detection health once per second.
+    // hypothesisId meanings: H1=I2C not wired; H2=fb_get starvation; H3=...
     noInterrupts();
     uint32_t reqs  = i2cReqCount;
     uint32_t recvs = i2cRecvCount;
     interrupts();
-    Serial.printf("DBG|cam_i2c_req_count|n=%lu|recv=%lu\n",
+    uint32_t fbOk   = dbgDetectFbOk;
+    uint32_t fbFail = dbgDetectFbFail;
+    Serial.printf("DBG|cam_i2c_req_count|hypothesisId=H1_i2c_wiring|n=%lu|recv=%lu\n",
                   (unsigned long)reqs, (unsigned long)recvs);
+    Serial.printf(
+      "DBG|detect_health|hypothesisId=H2_detection_loop|fb_ok=%lu|fb_fail=%lu|w=%d|h=%d|heap=%u\n",
+      (unsigned long)fbOk, (unsigned long)fbFail, dbgLastW, dbgLastH,
+      (unsigned)ESP.getFreeHeap());
     // #endregion
   }
 }
