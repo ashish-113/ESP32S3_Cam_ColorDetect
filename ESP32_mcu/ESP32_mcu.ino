@@ -78,8 +78,13 @@
 #define CAM_I2C_ADDR    0x52
 #define I2C_SDA_PIN     21
 #define I2C_SCL_PIN     22
+// 100 kHz standard; drop to 50000 here if wires are long / noisy breadboard.
 #define I2C_FREQ_HZ     100000
 #define CAM_POLL_MS     200
+
+// Periodically re-scan while the camera stays unreachable (captures scans even
+// if boot logs scrolled away). Milliseconds; set 0 to disable.
+#define I2C_RESCAN_WHILE_INVALID_MS  5000
 
 // ---------- Servo (ESP32Servo library) ----------
 #define SERVO_PIN              23
@@ -157,6 +162,41 @@ const char* colorName(uint8_t code) {
   }
 }
 
+// ESP32 Arduino Wire.endTransmission(): 0 OK, 1 buffer, 2 NACK addr, 3 NACK data,
+// 4 other (driver/bus state), 5 timeout. Wording mirrors core docs.
+static const char* i2cEndTxExplain(uint8_t tx) {
+  switch (tx) {
+    case 1: return "buffer";
+    case 2: return "nack_addr";
+    case 3: return "nack_data";
+    case 4: return "esp_other_error";
+    case 5: return "timeout";
+    default: return "unknown_code";
+  }
+}
+
+// Emit DBG|i2c_scan_* lines; returns number of ACKing addresses (hits on 0x52).
+static uint8_t dbgI2cBusScan(const char* tag, bool printHits) {
+  // #region agent log
+  Serial.printf("DBG|i2c_scan_start|hypothesisId=H_scan|tag=%s\n", tag);
+  uint8_t found = 0;
+  uint8_t hit52 = 0;
+  for (uint8_t addr = 1; addr < 127; addr++) {
+    Wire.beginTransmission(addr);
+    uint8_t err = Wire.endTransmission();
+    if (err == 0) {
+      if (printHits) Serial.printf("DBG|i2c_scan_hit|addr=0x%02X\n", addr);
+      found++;
+      if (addr == CAM_I2C_ADDR) hit52++;
+    }
+  }
+  Serial.printf(
+    "DBG|i2c_scan_done|hypothesisId=H_scan|tag=%s|found=%u|hit52=%u|expected_cam=0x%02X\n",
+    tag, found, hit52, CAM_I2C_ADDR);
+  return found;
+  // #endregion
+}
+
 void pollCamera() {
   camValid = false;
   Wire.beginTransmission(CAM_I2C_ADDR);
@@ -164,16 +204,16 @@ void pollCamera() {
   uint8_t tx = Wire.endTransmission();
   if (tx != 0) {
     // #region agent log
-    // Slave didn't ACK or bus error. tx codes (Arduino ESP32 Wire):
-    //   2 = NACK on address (no slave / wrong addr / wrong pins)
-    //   3 = NACK on data
-    //   4 = other error
-    //   5 = timeout (often: no pull-ups / missing GND)
-    // Hypotheses tested: H1, H2, H3, H4.
+    // tx=4 "other error" observed in field: floating SDA/SCL, wrong slave pins,
+    // or bus glitch — not always the classic NACK-addr tx=2.
+    // Hypotheses: H_pins (slave GPIO wrong), H_gnd (no common ground),
+    // H_pullups (none / too weak / only on one side), H_freq (marginal wires).
     static uint32_t lastTxErr = 0;
     if (millis() - lastTxErr > 2000) {
       lastTxErr = millis();
-      Serial.printf("DBG|poll_tx_err|tx=%u\n", tx);
+      Serial.printf(
+        "DBG|poll_tx_err|hypothesisId=H_poll_tx|tx=%u|tx_meaning=%s|addr=0x%02X|reg=0x00\n",
+        tx, i2cEndTxExplain(tx), CAM_I2C_ADDR);
     }
     // #endregion
     return;
@@ -253,29 +293,15 @@ void setup() {
 
   // I2C master on default ESP32 pins (21=SDA, 22=SCL).
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN, (uint32_t)I2C_FREQ_HZ);
+  // Reinforce idle-high on marginal breadboards (prefer 4.7k external pull-ups
+  // to 3V3).
+  pinMode(I2C_SDA_PIN, INPUT_PULLUP);
+  pinMode(I2C_SCL_PIN, INPUT_PULLUP);
   Serial.printf("I2C master ready, polling camera @0x%02X on SDA=%d SCL=%d\n",
                 CAM_I2C_ADDR, I2C_SDA_PIN, I2C_SCL_PIN);
 
   // #region agent log
-  // Probe the I2C bus for any responding slave. Prints a hit per address that
-  // ACKs, plus a summary line so we can tell apart "no bus" / "bus but wrong
-  // address" / "camera at 0x52 OK".
-  // Tests H1 (camera pins wrong), H2 (camera firmware not flashed), H3 (no
-  // common ground), H4 (robot Wire.begin failed/wrong wires).
-  Serial.println("DBG|i2c_scan_start");
-  {
-    uint8_t found = 0;
-    for (uint8_t addr = 1; addr < 127; addr++) {
-      Wire.beginTransmission(addr);
-      uint8_t err = Wire.endTransmission();
-      if (err == 0) {
-        Serial.printf("DBG|i2c_scan_hit|addr=0x%02X\n", addr);
-        found++;
-      }
-    }
-    Serial.printf("DBG|i2c_scan_done|found=%u|expected_cam=0x%02X\n",
-                  found, CAM_I2C_ADDR);
-  }
+  dbgI2cBusScan("boot", true);
   // #endregion
 
   // Servo on GPIO 23, parked at rest.
@@ -309,6 +335,15 @@ void loop() {
 
   // ---- poll camera over I2C every CAM_POLL_MS ----
   static uint32_t lastPoll = 0;
+  static uint32_t lastInvalidRescan = 0;
+#if I2C_RESCAN_WHILE_INVALID_MS > 0
+  if (!camValid && (millis() - lastInvalidRescan > I2C_RESCAN_WHILE_INVALID_MS)) {
+    lastInvalidRescan = millis();
+    // #region agent log
+    dbgI2cBusScan("periodic", true);
+    // #endregion
+  }
+#endif
   if (millis() - lastPoll > CAM_POLL_MS) {
     lastPoll = millis();
     pollCamera();
